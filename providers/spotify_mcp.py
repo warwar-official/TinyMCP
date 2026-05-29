@@ -1,0 +1,389 @@
+import os
+import json
+import base64
+import requests
+import dotenv
+from typing import Any
+from providers.base import BaseProvider
+
+class SpotifyMCP(BaseProvider):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.access_token: str | None = None
+        self.refresh_token: str | None = None
+        self.client_id: str | None = None
+        self.client_secret: str | None = None
+        
+        self._load_tokens()
+
+    def _load_tokens(self) -> None:
+        dotenv.load_dotenv(override=True)
+        self.access_token = os.getenv("SPOTIFY_ACCESS_TOKEN")
+        self.refresh_token = os.getenv("SPOTIFY_REFRESH_TOKEN")
+        self.client_id = os.getenv("SPOTIFY_CLIENT_ID")
+        self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+
+    def _save_tokens(self, access_token: str, refresh_token: str | None = None) -> None:
+        self.access_token = access_token
+        from pathlib import Path
+        dotenv_path = Path(__file__).parent.parent / ".env"
+        dotenv.set_key(dotenv_path, "SPOTIFY_ACCESS_TOKEN", access_token)
+        if refresh_token:
+            self.refresh_token = refresh_token
+            dotenv.set_key(dotenv_path, "SPOTIFY_REFRESH_TOKEN", refresh_token)
+
+    def _refresh_access_token(self) -> bool:
+        if not self.refresh_token:
+            return False
+            
+        url = "https://accounts.spotify.com/api/token"
+        auth_string = f"{self.client_id}:{self.client_secret}"
+        b64_auth = base64.b64encode(auth_string.encode()).decode()
+        
+        headers = {
+            "Authorization": f"Basic {b64_auth}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": self.refresh_token
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, data=data, timeout=10)
+            if response.status_code == 200:
+                resp_data = response.json()
+                new_access_token = resp_data.get("access_token")
+                new_refresh_token = resp_data.get("refresh_token") # sometimes Spotify doesn't return a new one
+                self._save_tokens(new_access_token, new_refresh_token)
+                return True
+        except Exception as e:
+            print(f"SpotifyMCP: Token refresh failed: {e}")
+            
+        return False
+
+    def _get_id_from_uri(self, uri_or_id: str) -> str:
+        """Extracts the ID from a Spotify URI (e.g., 'spotify:playlist:XYZ' -> 'XYZ') or returns the ID as is."""
+        if isinstance(uri_or_id, str) and uri_or_id.startswith("spotify:"):
+            return uri_or_id.split(":")[-1]
+        return uri_or_id
+
+    def _make_request(self, method: str, endpoint: str, params: dict | None = None, json_data: dict | None = None) -> dict:
+        if not self.access_token:
+            # Try to load just in case
+            self._load_tokens()
+            if not self.access_token:
+                return {"status": "error", "message": "No access token. Please authenticate Spotify."}
+
+        # Build full URL if the endpoint is relative to API
+        url = endpoint if endpoint.startswith("http") else f"https://api.spotify.com/v1{endpoint}"
+        
+        for attempt in range(2):
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+            try:
+                response = requests.request(method, url, headers=headers, params=params, json=json_data, timeout=10)
+                
+                if response.status_code == 401:
+                    if attempt == 0 and self._refresh_access_token():
+                        continue
+                    return {"status": "error", "message": "Unauthorized or token expired"}
+                
+                if response.status_code == 403:
+                    return {"status": "error", "message": "Forbidden. Check your scopes (playlist-modify-public/private) or if the account is premium for playback control."}
+                
+                if response.status_code == 404:
+                    return {"status": "error", "message": "Resource not found or invalid ID."}
+                
+                if 200 <= response.status_code < 300:
+                    try:
+                        data = response.json()
+                        return {"status": "success", "data": data}
+                    except ValueError:
+                        return {"status": "success", "data": None, "message": "Success"}
+                
+                return {
+                    "status": "error", 
+                    "message": f"Spotify API error: {response.status_code} - {response.text}"
+                }
+                
+            except requests.exceptions.Timeout:
+                if attempt == 0:
+                    continue
+                return {"status": "error", "message": "Request timed out"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        return {"status": "error", "message": "Request failed after retries."}
+
+    def _rpc_tool_execute(self, params: dict) -> Any:
+        name = params.get("name")
+        args = params.get("arguments", {})
+        
+        if name == "playback_control":
+            action = args.get("action", "")
+            if action == "play":
+                req_data = {}
+                uris = args.get("uris")
+                context_uri = args.get("context_uri")
+                offset = args.get("offset")
+                
+                if uris:
+                    req_data["uris"] = uris
+                elif context_uri:
+                    req_data["context_uri"] = context_uri
+                    
+                if offset is not None:
+                    req_data["offset"] = offset
+                    
+                if req_data:
+                    return self._make_request("PUT", "/me/player/play", json_data=req_data)
+                return self._make_request("PUT", "/me/player/play")
+            elif action == "pause":
+                return self._make_request("PUT", "/me/player/pause")
+            elif action == "next":
+                return self._make_request("POST", "/me/player/next")
+            elif action == "previous":
+                return self._make_request("POST", "/me/player/previous")
+            return {"status": "error", "message": f"Unknown action: {action}"}
+            
+        elif name == "playback_mode":
+            repeat = args.get("repeat")
+            shuffle = args.get("shuffle")
+            
+            res1 = {"status": "success"}
+            if repeat is not None:
+                res1 = self._make_request("PUT", "/me/player/repeat", params={"state": repeat})
+            
+            res2 = {"status": "success"}
+            if shuffle is not None:
+                res2 = self._make_request("PUT", "/me/player/shuffle", params={"state": "true" if shuffle else "false"})
+                
+            if res1.get("status") == "error": return res1
+            if res2.get("status") == "error": return res2
+            return {"status": "success", "message": "Playback mode updated"}
+            
+        elif name == "search":
+            query = args.get("query", "")
+            limit = args.get("limit", 5)
+            types_list = args.get("type", ["track"])
+            types_str = ",".join(types_list)
+            
+            res = self._make_request("GET", "/search", params={"q": query, "type": types_str, "limit": limit})
+            if res.get("status") == "success":
+                results = []
+                # Spotify returns items nested under type name with 's' suffix, e.g. tracks, albums
+                for t in types_list:
+                    key = t + "s"
+                    items = res["data"].get(key, {}).get("items", [])
+                    for item in items:
+                        if not item: # sometimes API can return None in the list
+                            continue
+                        artists = ", ".join([a.get("name") for a in item.get("artists", [])]) if "artists" in item else None
+                        results.append({
+                            "type": item.get("type"),
+                            "name": item.get("name"),
+                            "artist": artists,
+                            "id": item.get("id"),
+                            "uri": item.get("uri")
+                        })
+                return {"status": "success", "data": results}
+            return res
+            
+        elif name == "create_playlist":
+            playlist_name = args.get("name")
+            # 1. Check if playlist already exists
+            user_playlists_res = self._make_request("GET", "/me/playlists")
+            if user_playlists_res.get("status") == "success":
+                playlists = user_playlists_res.get("data", {}).get("items", [])
+                for pl in playlists:
+                    if pl.get("name") == playlist_name:
+                        return {
+                            "status": "success",
+                            "message": f"Playlist '{playlist_name}' already exists. Found existing ID.",
+                            "data": {
+                                "id": pl.get("id"),
+                                "name": pl.get("name"),
+                                "description": pl.get("description")
+                            }
+                        }
+
+            # 2. Proceed with creation if not found
+            return self._make_request("POST", "/me/playlists", json_data={
+                "name": playlist_name,
+                "description": args.get("description", ""),
+                "public": args.get("public", True)
+            })
+            
+        elif name == "add_to_playlist":
+            playlist_id = self._get_id_from_uri(args.get("playlist_id"))
+            # Accept both a single track_uri (string) and track_uris (list)
+            track_uris = args.get("track_uris") or args.get("uris")
+            if not track_uris:
+                single = args.get("track_uri")
+                track_uris = [single] if single else []
+            if not isinstance(track_uris, list):
+                track_uris = [track_uris]
+            if not track_uris:
+                return {"status": "error", "message": "No track URIs provided."}
+            # Spotify allows up to 100 URIs per request
+            results = []
+            for i in range(0, len(track_uris), 100):
+                chunk = track_uris[i:i + 100]
+                res = self._make_request("POST", f"/playlists/{playlist_id}/items", json_data={"uris": chunk})
+                results.append(res)
+                if res.get("status") != "success":
+                    return res
+            return {"status": "success", "message": f"Added {len(track_uris)} track(s) to playlist."}
+            
+        elif name == "remove_from_playlist":
+            playlist_id = self._get_id_from_uri(args.get("playlist_id"))
+            track_uris = args.get("track_uris") or args.get("uris")
+            if not track_uris:
+                single = args.get("track_uri")
+                track_uris = [single] if single else []
+            if not isinstance(track_uris, list):
+                track_uris = [track_uris]
+            if not track_uris:
+                return {"status": "error", "message": "No track URIs provided."}
+
+            snapshot_id = args.get("snapshot_id")
+            results = []
+            for i in range(0, len(track_uris), 100):
+                chunk = track_uris[i:i + 100]
+                items = [{"uri": uri} for uri in chunk]
+                req_data = {"items": items}
+                if snapshot_id:
+                    req_data["snapshot_id"] = snapshot_id
+                    
+                res = self._make_request("DELETE", f"/playlists/{playlist_id}/items", json_data=req_data)
+                results.append(res)
+                if res.get("status") != "success":
+                    return res
+            return {"status": "success", "message": f"Removed {len(track_uris)} track(s) from playlist."}
+            
+        elif name == "get_playlist":
+            playlist_id = self._get_id_from_uri(args.get("playlist_id"))
+            res = self._make_request("GET", f"/playlists/{playlist_id}")
+            if res.get("status") == "success" and res.get("data"):
+                data = res["data"]
+                items = []
+                for track_item in data.get("items", []).get("items", []):
+                    track = track_item.get("item")
+                    if not track:
+                        continue
+                    artists = ", ".join([a.get("name", "") for a in track.get("artists", [])])
+                    items.append({
+                        "uri": track.get("uri"),
+                        "name": track.get("name"),
+                        "artist": artists
+                    })
+                return {
+                    "status": "success",
+                    "data": {
+                        "uri": data.get("uri"),
+                        "name": data.get("name"),
+                        "owner.display_name": data.get("owner", {}).get("display_name"),
+                        "owner.uri": data.get("owner", {}).get("uri"),
+                        "total_tracks": data.get("items", {}).get("total", 0),
+                        "items": items
+                    }
+                }
+            return res
+            
+        elif name == "get_user_playlists":
+            limit = args.get("limit", 50)
+            offset = args.get("offset", 0)
+            res = self._make_request("GET", "/me/playlists", params={"limit": limit, "offset": offset})
+            if res.get("status") == "success" and res.get("data"):
+                items = res["data"].get("items", [])
+                playlists = []
+                for pl in items:
+                    if not pl:
+                        continue
+                    playlists.append({
+                        "uri": pl.get("uri"),
+                        "name": pl.get("name"),
+                        "owner.display_name": pl.get("owner", {}).get("display_name", ""),
+                        "owner.uri": pl.get("owner", {}).get("uri", "")
+                    })
+                return {
+                    "status": "success", 
+                    "data": {
+                        "total": res["data"].get("total", 0),
+                        "items": playlists
+                    }
+                }
+            return res
+            
+        elif name == "get_playback_state":
+            res = self._make_request("GET", "/me/player")
+            if res.get("status") == "success" and res.get("data"):
+                data = res["data"]
+                return {
+                    "status": "success",
+                    "data": {
+                        "device": data.get("device", {}).get("name"),
+                        "track": data.get("item", {}).get("name") if data.get("item") else None,
+                        "state": "play" if data.get("is_playing") else "paused",
+                        "playback_mode": {
+                            "repeat": data.get("repeat_state"),
+                            "shuffle": data.get("shuffle_state")
+                        }
+                    }
+                }
+            return res
+            
+        elif name == "get_playback_device":
+            return self._make_request("GET", "/me/player/devices")
+            
+        elif name == "set_playback_device":
+            device_id = self._get_id_from_uri(args.get("device_id"))
+            return self._make_request("PUT", "/me/player", json_data={"device_ids": [device_id]})
+            
+        elif name == "get_lyrics":
+            artist = args.get("artist", "")
+            track_name = args.get("track_name", "")
+            import hashlib
+
+            cache_key = hashlib.md5(f"{artist}:{track_name}".encode("utf-8")).hexdigest()
+            cache_dir = "data/cache/lyrics"
+            cache_file = os.path.join(cache_dir, f"{cache_key}.json")
+
+            # Cache hit — return immediately, skip KB ingestion (already indexed on first fetch)
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        cached = json.load(f)
+                    return {"status": "success", "data": cached}
+                except Exception:
+                    pass  # Corrupt cache — fall through to network fetch
+
+            try:
+                response = requests.get(
+                    f"https://api.lyrics.ovh/v1/{artist}/{track_name}", timeout=10
+                )
+                if response.status_code == 200:
+                    lyrics_text = response.json().get("lyrics", "")
+
+                    # Persist to disk cache
+                    os.makedirs(cache_dir, exist_ok=True)
+                    try:
+                        with open(cache_file, "w", encoding="utf-8") as f:
+                            json.dump(
+                                {"lyrics": lyrics_text, "artist": artist, "track_name": track_name},
+                                f,
+                                ensure_ascii=False,
+                            )
+                    except Exception as e:
+                        print(f"SpotifyMCP: Failed to write lyrics cache: {e}")
+
+                    # (KB ingestion removed for standalone MCP server)
+
+                    return {"status": "success", "data": {"lyrics": lyrics_text}}
+                return {"status": "error", "message": f"Lyrics not found. Status: {response.status_code}"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        else:
+            raise ValueError(f"SpotifyMCP: Unknown tool {name}")
+
