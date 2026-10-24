@@ -26,6 +26,7 @@ async def main():
     
     providers = {}
     tools_list = []
+    tool_registry = {}  # Maps full_tool_name → (namespace, method) for robust lookup
     
     for server_cfg in config.get("servers", []):
         mcp_name = server_cfg["mcp_name"]
@@ -42,6 +43,9 @@ async def main():
             tool_name = tool_cfg["name"]
             full_tool_name = f"{mcp_name}_{tool_name}"
             
+            # Register the mapping: full_name → (namespace, method)
+            tool_registry[full_tool_name] = (mcp_name, tool_name)
+            
             tool_obj = types.Tool(
                 name=full_tool_name,
                 description=tool_cfg.get("description", ""),
@@ -55,15 +59,12 @@ async def main():
         
     @app.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-        if "_" not in name:
-            raise ValueError(f"Invalid tool name format: {name}")
+        # Use lookup mapping for robust name resolution (handles namespaces with underscores)
+        if name not in tool_registry:
+            raise ValueError(f"Unknown tool: {name}")
             
-        # Extract namespace and actual tool name. Since tool_name could contain underscores, we split only once.
-        namespace, tool_method = name.split("_", 1)
+        namespace, tool_method = tool_registry[name]
         
-        if namespace not in providers:
-            raise ValueError(f"Unknown tool namespace: {namespace}")
-            
         provider = providers[namespace]
         
         try:
